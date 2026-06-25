@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -12,49 +13,48 @@ import (
 	"time"
 
 	"github.com/cloudwego/eino-ext/components/model/deepseek"
-	"github.com/cloudwego/eino/adk"
-	"github.com/cloudwego/eino/components/tool"
-	"github.com/cloudwego/eino/components/tool/utils"
-	"github.com/cloudwego/eino/compose"
+	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
 	"github.com/joho/godotenv"
 )
 
 /**
  * @Description: 21-claude-code-agent-loop
-
- The entire secret of an AI coding agent in one pattern:
-
-    while stop_reason == "tool_use":
-        response = LLM(messages, tools)
-        execute tools
-        append results
-
-    +----------+      +-------+      +---------+
-    |   User   | ---> |  LLM  | ---> |  Tool   |
-    |  prompt  |      |       |      | execute |
-    +----------+      +---+---+      +----+----+
-                          ^               |
-                          |   tool_result |
-                          +---------------+
-                          (loop continues)
-
-This is the core loop: feed tool results back to the model
-until the model decides to stop. Production agents layer
-policy, hooks, and lifecycle controls on top.
-*/
+ *
+ * The entire secret of an AI coding agent in one pattern:
+ *
+ *    while stop_reason == "tool_use":
+ *        response = LLM(messages, tools)
+ *        execute tools
+ *        append results
+ *
+ *    +----------+      +-------+      +---------+
+ *    |   User   | ---> |  LLM  | ---> |  Tool   |
+ *    |  prompt  |      |       |      | execute |
+ *    +----------+      +---+---+      +----+----+
+ *                          ^               |
+ *                          |   tool_result |
+ *                          +---------------+
+ *                          (loop continues)
+ *
+ * This is the core loop: feed tool results back to the model
+ * until the model decides to stop. Production agents layer
+ * policy, hooks, and lifecycle controls on top.
+ *
+ * Go + eino 版本：手动 agent loop，直接调用 LLM.Generate，
+ * 检查 ResponseMeta.FinishReason，手动执行工具并追加 tool result。
+ */
 
 // loadEnv 加载 .env 文件。文件不存在仅警告，不中断启动。
 func loadEnv() {
-	if err := godotenv.Load(); err != nil {
+	if err := godotenv.Load("../.env"); err != nil {
 		log.Printf("warning: failed to load .env file: %v", err)
 	}
 }
 
 // runBash 在受限目录下执行 shell 命令。
 //
-// 返回约定（注意：eino 工具框架在 error 非空时只回传 error message，
-// 所以诊断信息必须放进 error 里，否则 LLM 和用户看不到）：
+// 返回约定：
 //   - 成功（exit 0）          -> (output, nil)
 //   - 失败（非 0 退出码）     -> ("", error)   error 中含 command + exit 信息 + output
 //   - 超时（>120s）           -> ("", error)   error 中含 command + 部分 output
@@ -86,7 +86,6 @@ func runBash(command string) (string, error) {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "bash", "-c", command)
-	// 工作目录获取失败时，让命令在默认目录运行而不是吞错
 	if dir, err := os.Getwd(); err == nil {
 		cmd.Dir = dir
 	} else {
@@ -112,12 +111,101 @@ func runBash(command string) (string, error) {
 	return output, nil
 }
 
+// agentLoop 是核心模式：持续调用 LLM 直到模型不再请求工具调用。
+//
+// Python 原始逻辑：
+//
+//	while True:
+//	    response = client.messages.create(model=..., messages=messages, tools=tools)
+//	    messages.append({"role": "assistant", "content": response.content})
+//	    if response.stop_reason != "tool_use":
+//	        return
+//	    for block in response.content:
+//	        if block.type == "tool_use":
+//	            output = run_bash(block.input["command"])
+//	            results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
+//	    messages.append({"role": "user", "content": results})
+func agentLoop(ctx context.Context, chatModel model.ToolCallingChatModel, messages []*schema.Message) ([]*schema.Message, error) {
+	for {
+		// 调用 LLM
+		resp, err := chatModel.Generate(ctx, messages)
+		if err != nil {
+			return messages, fmt.Errorf("LLM generate failed: %w", err)
+		}
+
+		// 追加 assistant 消息到历史
+		messages = append(messages, resp)
+
+		// 检查 stop reason：如果不是 "tool_calls"，说明模型已经完成，不再需要调用工具
+		finishReason := ""
+		if resp.ResponseMeta != nil {
+			finishReason = resp.ResponseMeta.FinishReason
+		}
+		if finishReason != "tool_calls" {
+			// 模型不再请求工具调用，循环结束
+			return messages, nil
+		}
+
+		// 执行每个工具调用，收集结果
+		var toolResults []*schema.Message
+		for _, tc := range resp.ToolCalls {
+			// Arguments 是 JSON 字符串，如 {"command": "echo hello"}
+			// 需要反序列化解析出 command 字段
+			var args struct {
+				Command string `json:"command"`
+			}
+			if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
+				toolResults = append(toolResults, schema.ToolMessage(
+					fmt.Sprintf("Error: failed to parse arguments: %v", err),
+					tc.ID,
+					schema.WithToolName("bash"),
+				))
+				continue
+			}
+
+			command := strings.TrimSpace(args.Command)
+			if command == "" {
+				toolResults = append(toolResults, schema.ToolMessage(
+					"Error: missing command argument",
+					tc.ID,
+					schema.WithToolName("bash"),
+				))
+				continue
+			}
+
+			fmt.Printf("\033[33m$ %s\033[0m\n", command)
+
+			output, err := runBash(command)
+			if err != nil {
+				output = fmt.Sprintf("Error: %v", err)
+			}
+
+			// 截断输出显示
+			display := output
+			if len(display) > 200 {
+				display = display[:200]
+			}
+			fmt.Println(display)
+
+			// 追加 tool result 消息
+			toolResults = append(toolResults, schema.ToolMessage(
+				output,
+				tc.ID,
+				schema.WithToolName("bash"),
+			))
+		}
+
+		// 将工具执行结果追加回 messages，循环继续
+		messages = append(messages, toolResults...)
+	}
+}
+
 func main() {
 	ctx := context.Background()
 
 	loadEnv()
 
-	// 必需的环境变量从启动期就校验，避免 nil 模型导致后续 panic
+	// 必需的环境变量从启动期就校验
 	required := []string{"ARK_API_KEY", "ARK_BASE_URL", "ARK_MODEL"}
 	for _, key := range required {
 		if os.Getenv(key) == "" {
@@ -130,9 +218,10 @@ func main() {
 		log.Fatalf("failed to get working directory: %v", err)
 	}
 
-	fmt.Println("s01: Agent Loop")
-	fmt.Println("输入问题，回车发送。输入 q / exit 退出。")
+	fmt.Println("s01: Agent Loop (eino manual loop)")
+	fmt.Println("输入问题，回车发送。输入 q / exit 退出。\n")
 
+	// 创建 ChatModel（底层 BaseChatModel）
 	chatModel, err := deepseek.NewChatModel(ctx, &deepseek.ChatModelConfig{
 		APIKey:  os.Getenv("ARK_API_KEY"),
 		BaseURL: os.Getenv("ARK_BASE_URL"),
@@ -147,51 +236,28 @@ func main() {
 		currentDir,
 	)
 
-	bashTool := utils.NewTool(
-		&schema.ToolInfo{
-			Name: "bash",
-			Desc: "Run a shell command",
-			ParamsOneOf: schema.NewParamsOneOfByParams(map[string]*schema.ParameterInfo{
-				"command": {
-					Type:     schema.String,
-					Desc:     "The shell command to run",
-					Required: true,
-				},
-			}),
-		},
-		func(ctx context.Context, params map[string]interface{}) (string, error) {
-			command, ok := params["command"].(string)
-			if !ok {
-				return "", fmt.Errorf("command must be a string")
-			}
-			command = strings.TrimSpace(command)
-			if command == "" {
-				return "", fmt.Errorf("command is empty")
-			}
-			return runBash(command)
-		},
-	)
-
-	agent, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
-		Name:        "SimpleAssistant",
-		Description: "a simple assistant that can answer user questions.",
-		Instruction: systemPrompt,
-		Model:       chatModel,
-		ToolsConfig: adk.ToolsConfig{
-			ToolsNodeConfig: compose.ToolsNodeConfig{
-				Tools: []tool.BaseTool{bashTool},
+	// 绑定 bash 工具
+	bashToolInfo := &schema.ToolInfo{
+		Name: "bash",
+		Desc: "Run a shell command.",
+		ParamsOneOf: schema.NewParamsOneOfByParams(map[string]*schema.ParameterInfo{
+			"command": {
+				Type:     schema.String,
+				Desc:     "The shell command to run",
+				Required: true,
 			},
-		},
-	})
-	if err != nil {
-		log.Fatalf("failed to create agent: %v", err)
+		}),
 	}
 
-	// Runner 在内部维护 session，多次 Query 自动保留多轮上下文
-	runner := adk.NewRunner(ctx, adk.RunnerConfig{
-		Agent:           agent,
-		EnableStreaming: false,
-	})
+	chatModelWithTools, err := chatModel.WithTools([]*schema.ToolInfo{bashToolInfo})
+	if err != nil {
+		log.Fatalf("failed to bind tools: %v", err)
+	}
+
+	// 手动维护的消息历史
+	history := []*schema.Message{
+		schema.SystemMessage(systemPrompt),
+	}
 
 	scanner := bufio.NewScanner(os.Stdin)
 	for {
@@ -201,37 +267,27 @@ func main() {
 		}
 		query := strings.TrimSpace(scanner.Text())
 		if query == "" {
-			continue // 空输入重新提示，而不是退出
+			continue
 		}
 		if lower := strings.ToLower(query); lower == "q" || lower == "exit" {
 			break
 		}
 
-		iter := runner.Query(ctx, query)
-		for {
-			event, ok := iter.Next()
-			if !ok {
-				break
-			}
-			if event.Err != nil {
-				log.Printf("agent 执行错误: %v", event.Err)
-				continue
-			}
-			if event.Output == nil || event.Output.MessageOutput == nil {
-				continue
-			}
-			msg := event.Output.MessageOutput.Message
-			if msg == nil {
-				continue
-			}
-			if len(msg.ToolCalls) > 0 {
-				for _, tc := range msg.ToolCalls {
-					fmt.Printf("工具调用: %s\n", tc.Function.Name)
-				}
-				continue
-			}
-			if msg.Content != "" {
-				fmt.Printf("\n助手：%s\n\n", msg.Content)
+		// 追加用户消息
+		history = append(history, schema.UserMessage(query))
+
+		// 执行 agent loop
+		history, err = agentLoop(ctx, chatModelWithTools, history)
+		if err != nil {
+			log.Printf("agent loop error: %v", err)
+			continue
+		}
+
+		// 打印模型的最终文本响应
+		if len(history) > 0 {
+			lastMsg := history[len(history)-1]
+			if lastMsg.Role == schema.Assistant && lastMsg.Content != "" {
+				fmt.Printf("\n助手：%s\n\n", lastMsg.Content)
 			}
 		}
 	}
